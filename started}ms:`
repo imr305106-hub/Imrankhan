@@ -1,0 +1,120 @@
+notifications/initialized' ||
+    message.method === 'notifications/cancelled'
+  ) {
+    return new Response(null, { status: 202 });
+  }
+
+  if (message.method === 'ping') {
+    const body = new ReadableStream({
+      start(controller) {
+        setTimeout(() => controller.error(new Error('response leg lost')), 0);
+        // Replace the line above with controller.close() to reproduce clean EOF.
+      },
+    });
+    return new Response(body, {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  }
+
+  throw new Error(`Unexpected method: ${message.method}`);
+};
+
+const transport = new StreamableHTTPClientTransport(
+  new URL('https://example.test/mcp'),
+  { fetch: fetchImpl }
+);
+const client = new Client(
+  { name: 'repro', version: '1.0.0' },
+  { capabilities: {} }
+);
+client.onerror = error => console.log('onerror:', error.message);
+
+await client.connect(transport);
+const started = Date.now();
+try {
+  await client.ping({ timeout: 300 });
+} catch (error) {
+  console.log(`ping rejected after ${Date.now() - started}ms:`, error.message);
+}
+await client.close();
+Observed with the errored stream:
+
+onerror: SSE stream disconnected: Error: response leg lost
+ping rejected after 301ms: MCP error -32001: Request timed out
+A clean EOF produces only the timeout line.
+
+Expected behavior
+The request should reject promptly when its request-scoped SSE response can no longer deliver its JSON-RPC result or error. It should not wait for the unrelated protocol timeout.
+
+Cause and suggested seam
+send() starts _handleSseStream() without awaiting a request lifecycle. _handleSseStream() also launches its reader task without returning it. An SSE error therefore reaches only the global onerror callback, and EOF reaches neither the request nor onerror. Protocol has already seen send() resolve, so its timeout is the only remaining way to settle the request.
+
+The transport needs a request-scoped lifecycle tied to the IDs in that POST. It should resolve after all matching responses arrive, transfer ownership when a stream is resumable, and reject if a non-resumable body ends first. send() can then expose that rejection to Protocol's existing send failure path. The same lifecycle should accept request cancellation so a resumed chain cannot outlive its caller.
+
+JSON response mode already behaves this way because send() awaits response.json(), so a body failure rejects the request promptly.
+
+Versions
+Reproduced on Node 24.18.0 with:
+
+@modelcontextprotocol/sdk 1.26.0
+@modelcontextprotocol/sdk 1.29.0
+Related issues
+Streamable HTTP: a session teardown the caller did not request is indistinguishable from cancellation #2691: Streamable HTTP: a session teardown the caller did not request is indistinguishable from cancellation #2691, similar empty-SSE symptom, but its minimal reproduction intentionally cancelled via DELETE; this report does not initiate cancellation.
+StreamableHTTPClientTransport: 2-retry SSE reconnect ceiling + silent-success after exhaustion #2098: StreamableHTTPClientTransport: 2-retry SSE reconnect ceiling + silent-success after exhaustion #2098, standalone GET SSE reconnect exhaustion leaves later requests waiting for timeout.
+[v2] Legacy Streamable HTTP reconnects continue after the client request times out #2615: [v2] Legacy Streamable HTTP reconnects continue after the client request times out #2615, the inverse lifecycle leak, where a resumable request stream continues after the request has timed out.
+Bug: StreamableHTTPClientTransport Fails to Reconnect on Non-Resumable Streams #731: Bug: StreamableHTTPClientTransport Fails to Reconnect on Non-Resumable Streams #731, reconnect behavior for non-resumable standalone GET streams.
+Activity
+libaojiang commented 3 days ago
+@libaojiang
+libaojiang
+3d ago
+I'd like to work on this. I'll start with a focused transport regression test covering both SSE EOF and stream-error paths before a matching JSON-RPC response arrives. If the reproduction confirms the report, I'll keep the fix limited to promptly settling the pending request while preserving the existing successful-response behavior. Could a maintainer assign this issue to me?
+
+1320800521 commented yesterday
+@1320800521
+1320800521
+1d ago
+I reproduced this independently on 2026-09-01 with Node.js 22.18.0 using @modelcontextprotocol/sdk 1.29.0 and 1.30.0.
+
+Results with a 300 ms protocol timeout:
+
+SSE stream error: onerror fires at ~3-4 ms, but the request rejects only at ~304-306 ms with MCP error -32001: Request timed out.
+Clean SSE EOF before the matching JSON-RPC response: no onerror callback, request rejects at ~301-302 ms.
+application/json control response: resolves in ~1 ms.
+So the transport observes the stream failure/EOF promptly, but the pending JSON-RPC request is not settled until the outer timeout. I also verified that returning the same response as application/json avoids the delay.
+
+Minimal reproduction and captured logs: https://github.com/xbstack/mcp-streamable-http-sse-pending-repro
+
+Full write-up with the exact test boundary and mitigation notes: https://www.xbstack.com/en/ai/mcp-streamable-http-sse-pending-timeout/?utm_source=github&utm_medium=referral&utm_campaign=mcp_streamable_http_sse_pending&utm_content=issue_comment
+
+Add a comment
+new Comment
+Markdown input: edit mode selected.
+Write
+Preview
+Use Markdown to format your comment
+
+Please follow this repository's contributing guidelines, security policy and code of conduct.
+Metadata
+Assignees
+No one assigned
+Labels
+No labels
+Type
+No type
+Projects
+No projects
+Milestone
+No milestone
+Relationships
+None yet
+Development
+No branches or pull requests
+NotificationsCustomize
+You're receiving notifications because you're subscribed to this thread.
+
+Participants
+@jacekradko
+@1320800521
+@libaojiang
+Issue actions
